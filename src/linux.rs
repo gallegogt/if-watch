@@ -1,13 +1,22 @@
-use crate::{IfEvent, IpNet, Ipv4Net, Ipv6Net};
+use crate::{IfEvent, Iface, IpNet, Ipv4Net, Ipv6Net};
 use fnv::FnvHashSet;
 use futures::channel::mpsc::UnboundedReceiver;
-use futures::future::Either;
+use futures::future::{BoxFuture, Either};
 use futures::stream::{Stream, TryStreamExt};
+use futures::FutureExt;
 use rtnetlink::constants::{RTMGRP_IPV4_IFADDR, RTMGRP_IPV6_IFADDR};
 use rtnetlink::packet::address::nlas::Nla;
 use rtnetlink::packet::{AddressMessage, RtnlMessage};
 use rtnetlink::proto::{Connection, NetlinkMessage, NetlinkPayload};
-use rtnetlink::sys::{AsyncSocket, SmolSocket, SocketAddr};
+use rtnetlink::sys::{AsyncSocket, SocketAddr};
+
+#[cfg(feature = "async-io")]
+use rtnetlink::sys::SmolSocket;
+
+#[cfg(feature = "tokio")]
+use rtnetlink::sys::TokioSocket;
+
+use std::collections::hash_set::Iter;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{Error, ErrorKind, Result};
@@ -16,68 +25,95 @@ use std::ops::DerefMut;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-pub struct IfWatcher {
-    conn: Connection<RtnlMessage, SmolSocket>,
+#[cfg(feature = "async-io")]
+pub type AsioWatcher = LinuxWatcher<SmolSocket>;
+
+#[cfg(feature = "tokio")]
+pub type TokioWatcher = LinuxWatcher<TokioSocket>;
+
+pub struct LinuxWatcher<S>
+where
+    S: AsyncSocket,
+{
+    conn: Connection<RtnlMessage, S>,
     messages: UnboundedReceiver<(NetlinkMessage<RtnlMessage>, SocketAddr)>,
     addrs: FnvHashSet<IpNet>,
     queue: VecDeque<IfEvent>,
 }
 
-impl std::fmt::Debug for IfWatcher {
+impl<S> std::fmt::Debug for LinuxWatcher<S>
+where
+    S: AsyncSocket,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("IfWatcher")
+        f.debug_struct("LinuxWatcher")
             .field("addrs", &self.addrs)
             .finish_non_exhaustive()
     }
 }
 
-impl IfWatcher {
-    pub async fn new() -> Result<Self> {
-        let (mut conn, handle, messages) = rtnetlink::new_connection_with_socket::<SmolSocket>()?;
-        let groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
-        let addr = SocketAddr::new(0, groups);
-        conn.socket_mut().socket_mut().bind(&addr)?;
-        let mut stream = handle.address().get().execute();
-        let mut addrs = FnvHashSet::default();
-        let mut queue = VecDeque::default();
+impl<S> Iface for LinuxWatcher<S>
+where
+    S: AsyncSocket + std::marker::Send,
+{
+    fn init() -> BoxFuture<'static, Result<Self>>
+    where
+        Self: Sized,
+    {
+        async move {
+            let (mut conn, handle, messages) = rtnetlink::new_connection_with_socket::<S>()?;
+            let groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+            let addr = SocketAddr::new(0, groups);
+            conn.socket_mut().socket_mut().bind(&addr)?;
+            let mut stream = handle.address().get().execute();
+            let mut addrs = FnvHashSet::default();
+            let mut queue = VecDeque::default();
 
-        loop {
-            let fut = futures::future::select(conn, stream.try_next());
-            match fut.await {
-                Either::Left(_) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::BrokenPipe,
-                        "rtnetlink socket closed",
-                    ))
-                }
-                Either::Right((x, c)) => {
-                    conn = c;
-                    match x {
-                        Ok(Some(msg)) => {
-                            for net in iter_nets(msg) {
-                                if addrs.insert(net) {
-                                    queue.push_back(IfEvent::Up(net));
+            loop {
+                let fut = futures::future::select(conn, stream.try_next());
+                match fut.await {
+                    Either::Left(_) => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "rtnetlink socket closed",
+                        ))
+                    }
+                    Either::Right((x, c)) => {
+                        conn = c;
+                        match x {
+                            Ok(Some(msg)) => {
+                                for net in iter_nets(msg) {
+                                    if addrs.insert(net) {
+                                        queue.push_back(IfEvent::Up(net));
+                                    }
                                 }
                             }
+                            Ok(None) => break,
+                            Err(err) => return Err(Error::new(ErrorKind::Other, err)),
                         }
-                        Ok(None) => break,
-                        Err(err) => return Err(Error::new(ErrorKind::Other, err)),
                     }
                 }
             }
+
+            Ok(Self {
+                conn,
+                messages,
+                addrs,
+                queue,
+            })
         }
-        Ok(Self {
-            conn,
-            messages,
-            addrs,
-            queue,
-        })
+        .boxed()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &IpNet> {
+    fn networks(&self) -> Iter<IpNet> {
         self.addrs.iter()
     }
+}
 
+impl<S> LinuxWatcher<S>
+where
+    S: AsyncSocket + std::marker::Unpin,
+{
     fn add_address(&mut self, msg: AddressMessage) {
         for net in iter_nets(msg) {
             if self.addrs.insert(net) {
@@ -95,7 +131,10 @@ impl IfWatcher {
     }
 }
 
-impl Future for IfWatcher {
+impl<S> Future for LinuxWatcher<S>
+where
+    S: AsyncSocket + std::marker::Unpin,
+{
     type Output = Result<IfEvent>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
